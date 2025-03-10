@@ -107,6 +107,35 @@ impl TaskKillswitch {
         let _ = task_tx.send(ActiveTaskOp::Add { id, handle });
     }
 
+    fn spawn_task_with_hooks<T>(
+        &self, fut: impl Future<Output = ()> + Send + 'static, hooks: T,
+    ) where
+        T: tokio::runtime::TaskHookHarness + Send + Sync + 'static,
+    {
+        // NOTE: acquiring the lock here is very cheap, as unless the killswitch
+        // is activated, this one is always unlocked and this is just a
+        // few atomic operations.
+        let Some(task_tx) = self.task_tx.read().as_ref().cloned() else {
+            return;
+        };
+
+        let id = self.task_counter.fetch_add(1, Ordering::SeqCst);
+        let task_tx_weak = task_tx.downgrade();
+
+        let handle = tokio::task::spawn_with_hooks(
+            async move {
+                // NOTE: we use a weak sender inside the spawned task - dropping
+                // all strong senders activates the killswitch. In that case,
+                // we don't need to remove anything from ActiveTasks anymore.
+                let _guard = RemoveOnDrop { task_tx_weak, id };
+                fut.await;
+            },
+            hooks,
+        );
+
+        let _ = task_tx.send(ActiveTaskOp::Add { id, handle });
+    }
+
     fn activate(&self) {
         // take()ing the sender here drops it and thereby triggers the killswitch.
         // Concurrent spawn_task calls may still hold strong senders, which
@@ -167,6 +196,15 @@ static TASK_KILLSWITCH: LazyLock<TaskKillswitch> =
 #[inline]
 pub fn spawn_with_killswitch(fut: impl Future<Output = ()> + Send + 'static) {
     TASK_KILLSWITCH.spawn_task(fut);
+}
+
+#[inline]
+pub fn spawn_with_hooks_and_killswitch<T>(
+    fut: impl Future<Output = ()> + Send + 'static, hooks: T,
+) where
+    T: tokio::runtime::TaskHookHarness + Send + Sync + 'static,
+{
+    TASK_KILLSWITCH.spawn_task_with_hooks(fut, hooks);
 }
 
 #[deprecated = "activate() was unnecessarily declared async. Use activate_now() instead."]
